@@ -29,7 +29,9 @@ param(
     [Parameter(Position = 1)]
     [string]$OutputDirectory = '.',
 
-    [char]$Delimiter = ',',
+    # 'Auto' sniffs the header row for , ; tab or | . Pass an explicit
+    # character to override, e.g. -Delimiter ';'
+    [string]$Delimiter = 'Auto',
 
     [int]$Depth = 10,
 
@@ -101,8 +103,35 @@ process {
         throw "Could not open '$csvPath': $($_.Exception.Message)"
     }
 
-    $lines = $text -split "\r?\n"
-    $rows  = @(ConvertFrom-Csv -InputObject $lines -Delimiter $Delimiter)
+    $lines = @($text -split "\r?\n" | Where-Object { $_.Trim().Length -gt 0 })
+    if ($lines.Count -lt 2) {
+        throw "'$csvPath' has fewer than two non-empty lines - nothing to convert."
+    }
+
+    $header = $lines[0]
+
+    if ($Delimiter -eq 'Auto') {
+        $candidates = @(
+            [pscustomobject]@{ Char = ',';   Count = ([regex]::Matches($header, ',')).Count }
+            [pscustomobject]@{ Char = ';';   Count = ([regex]::Matches($header, ';')).Count }
+            [pscustomobject]@{ Char = "`t";  Count = ([regex]::Matches($header, "`t")).Count }
+            [pscustomobject]@{ Char = '|';   Count = ([regex]::Matches($header, '\|')).Count }
+        )
+        $best = $candidates | Sort-Object Count -Descending | Select-Object -First 1
+        if ($best.Count -eq 0) {
+            throw "Could not detect a delimiter in the header line of '$csvPath'.`nHeader was: $header`nPass one explicitly, e.g. -Delimiter ';'"
+        }
+        $sep = [char]$best.Char
+        Write-Verbose ("Auto-detected delimiter: '{0}'" -f $sep)
+    }
+    else {
+        if ($Delimiter.Length -ne 1) {
+            throw "-Delimiter must be a single character (or 'Auto'). Got: '$Delimiter'"
+        }
+        $sep = [char]$Delimiter
+    }
+
+    $rows = @(ConvertFrom-Csv -InputObject $lines -Delimiter $sep)
 
     if ($rows.Count -eq 0) {
         throw "'$csvPath' contains a header but no data rows."
@@ -110,7 +139,7 @@ process {
 
     $columns = @($rows[0].PSObject.Properties.Name)
     if ($columns.Count -lt 2) {
-        throw "'$csvPath' parsed as a single column. If it uses semicolons, re-run with -Delimiter ';'"
+        throw "'$csvPath' parsed as a single column using delimiter '$sep'.`nHeader line was: $header"
     }
 
     $attributeColumn = $columns[0]
