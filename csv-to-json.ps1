@@ -35,6 +35,13 @@ param(
 
     [int]$Depth = 10,
 
+    # Text inserted where a stray line break is removed. Default '' (glue the
+    # fragments together). Use ' ' if the break replaced a space.
+    [string]$JoinWith = '',
+
+    # Optional: write the repaired CSV here so you can inspect what was fixed.
+    [string]$SaveNormalizedCsv,
+
     # Overwrite existing .json files instead of skipping them.
     [switch]$Force
 )
@@ -44,6 +51,33 @@ begin {
     $ErrorActionPreference = 'Stop'
 
     $script:Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+
+    # Quote-aware scan of a partial CSV record. Returns how many fields it
+    # holds so far and whether it ends inside an open quoted field.
+    function Get-CsvState {
+        param([string]$Text, [char]$Separator)
+
+        $inQuotes = $false
+        $fields   = 1
+        $i        = 0
+
+        while ($i -lt $Text.Length) {
+            $c = $Text[$i]
+            if ($inQuotes) {
+                if ($c -eq '"') {
+                    if (($i + 1) -lt $Text.Length -and $Text[$i + 1] -eq '"') { $i++ }  # escaped ""
+                    else { $inQuotes = $false }
+                }
+            }
+            else {
+                if     ($c -eq '"')        { $inQuotes = $true }
+                elseif ($c -eq $Separator) { $fields++ }
+            }
+            $i++
+        }
+
+        return [pscustomobject]@{ Fields = $fields; InQuotes = $inQuotes }
+    }
 
     function ConvertTo-SafeFileName {
         param([string]$Name)
@@ -103,12 +137,15 @@ process {
         throw "Could not open '$csvPath': $($_.Exception.Message)"
     }
 
-    $lines = @($text -split "\r?\n" | Where-Object { $_.Trim().Length -gt 0 })
-    if ($lines.Count -lt 2) {
+    $rawLines = @($text -split "\r?\n")
+    while ($rawLines.Count -gt 0 -and $rawLines[-1].Trim().Length -eq 0) {
+        $rawLines = @($rawLines[0..($rawLines.Count - 2)])
+    }
+    if ($rawLines.Count -lt 2) {
         throw "'$csvPath' has fewer than two non-empty lines - nothing to convert."
     }
 
-    $header = $lines[0]
+    $header = $rawLines[0]
 
     if ($Delimiter -eq 'Auto') {
         $candidates = @(
@@ -131,7 +168,55 @@ process {
         $sep = [char]$Delimiter
     }
 
-    $rows = @(ConvertFrom-Csv -InputObject $lines -Delimiter $sep)
+    # --- normalize: repair records broken across physical lines ---------------
+    $expectedFields = (Get-CsvState -Text $header -Separator $sep).Fields
+    if ($expectedFields -lt 2) {
+        throw "'$csvPath' header parsed as a single column using delimiter '$sep'.`nHeader line was: $header"
+    }
+
+    $lines   = New-Object System.Collections.Generic.List[string]
+    $repairs = 0
+    $buffer  = $null
+
+    foreach ($line in $rawLines) {
+        if ($null -eq $buffer) {
+            if ($line.Trim().Length -eq 0) { continue }   # blank line between records
+            $buffer = $line
+        }
+        else {
+            $state = Get-CsvState -Text $buffer -Separator $sep
+            # A newline inside a quoted field is legitimate CSV content - keep it.
+            # A newline in an unterminated record is Confluence damage - remove it.
+            $buffer = if ($state.InQuotes) { $buffer + "`n" + $line } else { $buffer + $JoinWith + $line }
+            $repairs++
+        }
+
+        $state = Get-CsvState -Text $buffer -Separator $sep
+        if (-not $state.InQuotes -and $state.Fields -ge $expectedFields) {
+            if ($state.Fields -gt $expectedFields) {
+                Write-Warning ("Record starting '{0}' has {1} fields, expected {2}." -f `
+                    $buffer.Substring(0, [Math]::Min(40, $buffer.Length)), $state.Fields, $expectedFields)
+            }
+            $lines.Add($buffer)
+            $buffer = $null
+        }
+    }
+
+    if ($null -ne $buffer) {
+        Write-Warning "Last record is incomplete (fewer fields than the header). Keeping it as-is."
+        $lines.Add($buffer)
+    }
+
+    if ($repairs -gt 0) {
+        Write-Verbose "Repaired $repairs stray line break(s)."
+    }
+
+    if ($PSBoundParameters.ContainsKey('SaveNormalizedCsv')) {
+        [System.IO.File]::WriteAllText($SaveNormalizedCsv, ($lines -join "`r`n"), $script:Utf8NoBom)
+        Write-Verbose "Wrote normalized CSV to $SaveNormalizedCsv"
+    }
+
+    $rows = @(ConvertFrom-Csv -InputObject $lines.ToArray() -Delimiter $sep)
 
     if ($rows.Count -eq 0) {
         throw "'$csvPath' contains a header but no data rows."
