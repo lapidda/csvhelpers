@@ -79,6 +79,37 @@ begin {
         return [pscustomobject]@{ Fields = $fields; InQuotes = $inQuotes }
     }
 
+    # Attribute names: drop "(...)" groups (including nested ones), collapse
+    # the whitespace they leave behind, trim the ends.
+    function Format-AttributeName {
+        param([string]$Name)
+
+        $result = $Name
+        # Repeat so nested brackets are stripped from the inside out.
+        do {
+            $previous = $result
+            $result = [regex]::Replace($result, '\([^()]*\)', ' ')
+        } while ($result -ne $previous)
+
+        # An unmatched "(" - drop from there to the end rather than leaving it.
+        $result = [regex]::Replace($result, '\([^)]*$', ' ')
+
+        $result = [regex]::Replace($result, '\s+', ' ')
+        return $result.Trim()
+    }
+
+    # Values that should not produce a JSON property at all.
+    function Test-EmptyValue {
+        param([string]$Value)
+
+        if ([string]::IsNullOrWhiteSpace($Value)) { return $true }
+
+        $v = $Value.Trim()
+        if ($v -match '(?i)n\.\s*v\.') { return $true }   # n.v. / n. v.
+        if ($v -match '(?i)^leer$')    { return $true }   # literal "leer"
+        return $false
+    }
+
     function ConvertTo-SafeFileName {
         param([string]$Name)
         $invalid = [System.IO.Path]::GetInvalidFileNameChars() -join ''
@@ -235,14 +266,16 @@ process {
         $data = [ordered]@{}
 
         foreach ($row in $rows) {
-            $attribute = [string]$row.$attributeColumn
-            if ([string]::IsNullOrWhiteSpace($attribute)) { continue }   # skip blank/spacer rows
-            $attribute = $attribute.Trim()
+            $attribute = Format-AttributeName -Name ([string]$row.$attributeColumn)
+            if ([string]::IsNullOrWhiteSpace($attribute)) { continue }   # blank/spacer rows
+
+            $value = [string]$row.$record
+            if (Test-EmptyValue -Value $value) { continue }              # leer / n.v. -> omit
 
             if ($data.Contains($attribute)) {
                 Write-Warning "Duplicate attribute '$attribute' in '$record' - keeping the last value."
             }
-            $data[$attribute] = $row.$record
+            $data[$attribute] = $value.Trim()
         }
 
         $fileName = (ConvertTo-SafeFileName -Name $record) + '.json'
