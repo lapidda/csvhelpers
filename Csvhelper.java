@@ -1,3 +1,6 @@
+// If your project uses packages, add e.g. `package de.optimalhelper.csv;` above
+// and move this file to the matching folder under src/main/java.
+
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
@@ -57,6 +60,27 @@ public final class CsvToJsonGenerator {
     /** Text inserted where a stray line break is removed. */
     private static final String JOIN_WITH = "";
 
+    // ---- nesting configuration ---------------------------------------------
+    // The attribute that opens the group. Compare against the CLEANED name, i.e.
+    // without any "(...)" part. It stays a normal top-level field itself.
+    private static final String GROUP_TRIGGER_ATTRIBUTE = "Conditional";
+
+    /**
+     * Value the trigger attribute must have for grouping to happen.
+     * {@code null} = always group, regardless of the value.
+     * Set to {@code "N"} to only nest when the trigger reads N.
+     */
+    private static final String GROUP_TRIGGER_VALUE = null;
+
+    /**
+     * Grouping stops when this attribute is reached; that attribute and everything
+     * after it are written at top level again. {@code null} = group to end of record.
+     */
+    private static final String GROUP_END_ATTRIBUTE = "GroupEnd";
+
+    /** Name of the nested JSON object. */
+    private static final String GROUP_NAME = "customGroup";
+
     private static final Pattern INNERMOST_BRACKETS = Pattern.compile("\\([^()]*\\)");
     private static final Pattern UNCLOSED_BRACKET = Pattern.compile("\\([^)]*$");
     private static final Pattern WHITESPACE_RUN = Pattern.compile("\\s+");
@@ -109,7 +133,9 @@ public final class CsvToJsonGenerator {
         List<Path> written = new ArrayList<>();
         // Column 0 holds the attribute names; every further column is one record.
         for (int col = 1; col < header.size(); col++) {
-            Map<String, String> data = new LinkedHashMap<>();
+            Map<String, Object> data = new LinkedHashMap<>();
+            Map<String, Object> group = new LinkedHashMap<>();
+            boolean inGroup = false;
 
             for (int rowIdx = 1; rowIdx < table.size(); rowIdx++) {
                 List<String> row = table.get(rowIdx);
@@ -120,15 +146,37 @@ public final class CsvToJsonGenerator {
                 }
 
                 String value = cell(row, col);
-                if (isOmittedValue(value)) {
-                    continue;
+
+                // The end marker closes the group and is itself top level again.
+                if (inGroup && attribute.equals(GROUP_END_ATTRIBUTE)) {
+                    inGroup = false;
                 }
 
-                String previous = data.put(attribute, value.trim());
-                if (previous != null) {
-                    System.err.println("Warning: duplicate attribute '" + attribute
-                            + "' in column '" + header.get(col) + "' - keeping the last value.");
+                boolean isTrigger = attribute.equals(GROUP_TRIGGER_ATTRIBUTE);
+
+                // Decide on the raw value, before the omission rules can drop it.
+                boolean opensGroup = isTrigger
+                        && (GROUP_TRIGGER_VALUE == null || GROUP_TRIGGER_VALUE.equalsIgnoreCase(value.trim()));
+
+                if (!isOmittedValue(value)) {
+                    // The trigger itself stays top level; grouping starts after it.
+                    Map<String, Object> target = (inGroup && !isTrigger) ? group : data;
+                    Object previous = target.put(attribute, value.trim());
+                    if (previous != null) {
+                        System.err.println("Warning: duplicate attribute '" + attribute
+                                + "' in column '" + header.get(col) + "' - keeping the last value.");
+                    }
                 }
+
+                if (opensGroup) {
+                    inGroup = true;
+                    // Reserve the group's slot here so it appears in source order.
+                    data.put(GROUP_NAME, group);
+                }
+            }
+
+            if (group.isEmpty()) {
+                data.remove(GROUP_NAME);
             }
 
             Path target = outputDir.resolve(toFileName(header.get(col)) + ".json");
@@ -396,18 +444,44 @@ public final class CsvToJsonGenerator {
     // JSON output
     // ------------------------------------------------------------------
 
-    private static String toJson(Map<String, String> data) {
-        StringBuilder sb = new StringBuilder("{\n");
+    private static String toJson(Map<String, Object> data) {
+        StringBuilder sb = new StringBuilder();
+        writeObject(sb, data, 1);
+        return sb.append('\n').toString();
+    }
+
+    /** Writes a JSON object whose values are either Strings or nested Maps. */
+    @SuppressWarnings("unchecked")
+    private static void writeObject(StringBuilder sb, Map<String, Object> map, int depth) {
+        String pad = repeat("  ", depth);
+        String closePad = repeat("  ", depth - 1);
+
+        sb.append("{\n");
         int i = 0;
-        for (Map.Entry<String, String> entry : data.entrySet()) {
-            sb.append("  \"").append(escape(entry.getKey())).append("\": \"")
-              .append(escape(entry.getValue())).append('"');
-            if (++i < data.size()) {
+        for (Map.Entry<String, Object> entry : map.entrySet()) {
+            sb.append(pad).append('"').append(escape(entry.getKey())).append("\": ");
+
+            Object value = entry.getValue();
+            if (value instanceof Map) {
+                writeObject(sb, (Map<String, Object>) value, depth + 1);
+            } else {
+                sb.append('"').append(escape(String.valueOf(value))).append('"');
+            }
+
+            if (++i < map.size()) {
                 sb.append(',');
             }
             sb.append('\n');
         }
-        return sb.append("}\n").toString();
+        sb.append(closePad).append('}');
+    }
+
+    private static String repeat(String s, int times) {
+        StringBuilder sb = new StringBuilder(s.length() * times);
+        for (int i = 0; i < times; i++) {
+            sb.append(s);
+        }
+        return sb.toString();
     }
 
     private static String escape(String s) {
