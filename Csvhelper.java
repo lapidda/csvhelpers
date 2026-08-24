@@ -1,12 +1,8 @@
-// If your project uses packages, add e.g. `package de.optimalhelper.csv;` above
-// and move this file to the matching folder under src/main/java.
+// Falls das Projekt Packages verwendet: oben z.B. `package de.optimalhelper.csv;`
+// ergaenzen und die Datei in den passenden Ordner unter src/main/java legen.
 
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.InputStreamReader;
-import java.io.UncheckedIOException;
-import java.net.URISyntaxException;
-import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -18,10 +14,10 @@ import java.util.Map;
 import java.util.regex.Pattern;
 
 /**
- * Reads a transposed CSV from the classpath and writes one JSON file per data column.
+ * Liest eine "gedrehte" CSV vom Klassenpfad und schreibt pro Datenspalte eine JSON-Datei.
  *
- * <p>Expected layout - column 1 holds the attribute names, every further column is
- * one record:
+ * <p>Erwarteter Aufbau - Spalte 1 enthaelt die Attributnamen, jede weitere Spalte
+ * ist ein Datensatz:
  *
  * <pre>
  * Name;Server 01;Server 02
@@ -30,477 +26,443 @@ import java.util.regex.Pattern;
  * Rolle;Web;DB
  * </pre>
  *
- * produces {@code Server_01.json} and {@code Server_02.json}.
+ * erzeugt {@code Server_01.json} und {@code Server_02.json}.
  *
- * <p>Normalization applied:
+ * <p>Angewendete Normalisierung:
  * <ul>
- *   <li>Records broken across physical lines (Confluence export damage) are stitched
- *       back together; newlines inside quoted fields are preserved as real newlines.</li>
- *   <li>Attribute names lose any {@code (...)} groups, including nested ones, and are
- *       whitespace-collapsed and trimmed.</li>
- *   <li>Values that are blank, contain {@code n.v.}, or are exactly {@code leer} are
- *       omitted from the JSON entirely.</li>
- *   <li>Output file names have whitespace replaced with {@code _}.</li>
+ *   <li>Durch den Confluence-Export zerrissene Zeilen werden wieder zusammengesetzt;
+ *       Zeilenumbrueche innerhalb von Anfuehrungszeichen bleiben als echte Umbrueche erhalten.</li>
+ *   <li>Attributnamen verlieren alle {@code (...)}-Gruppen (auch verschachtelte)
+ *       und werden getrimmt.</li>
+ *   <li>Werte, die leer sind, {@code n.v.} enthalten oder exakt {@code leer} lauten,
+ *       werden komplett weggelassen.</li>
+ *   <li>Ab dem Start-Attribut werden Attribute in ein Unterobjekt gruppiert,
+ *       bis das Ende-Attribut erreicht ist (siehe Konstanten unten).</li>
+ *   <li>Dateinamen: Leerzeichen und pfad-kritische Zeichen werden durch {@code _} ersetzt.</li>
  * </ul>
  *
- * <p>No external dependencies - the JSON is written by hand (the values are always
- * strings, so this stays simple and correct).
+ * <p>Keine externen Abhaengigkeiten - CSV-Parser und JSON-Ausgabe sind von Hand
+ * geschrieben (die Werte sind immer Strings, das bleibt so einfach und korrekt).
  */
-public final class CsvToJsonGenerator {
+public final class CsvZuJsonGenerator {
 
-    /** CSV on the classpath, i.e. src/main/resources/FileRaw.csv */
-    private static final String INPUT_RESOURCE = "FileRaw.csv";
+    /** CSV auf dem Klassenpfad, d.h. src/main/resources/FileRaw.csv */
+    private static final String EINGABE_RESSOURCE = "FileRaw.csv";
 
-    /** Output folder, relative to the resources root. */
-    private static final String OUTPUT_FOLDER = "testfiles";
+    /** Ausgabeordner relativ zum resources-Verzeichnis. */
+    private static final String AUSGABE_ORDNER = "testfiles";
 
-    /** Candidate delimiters, sniffed from the header line. */
-    private static final char[] DELIMITER_CANDIDATES = {';', ',', '\t', '|'};
+    /** Moegliche Trennzeichen; das haeufigste in der Kopfzeile gewinnt. */
+    private static final char[] TRENNZEICHEN_KANDIDATEN = {';', ',', '\t', '|'};
 
-    /** Text inserted where a stray line break is removed. */
-    private static final String JOIN_WITH = "";
+    /** Text, der an der Stelle eines entfernten Zeilenumbruchs eingefuegt wird. */
+    private static final String VERBINDER = "";
 
-    // ---- nesting configuration ---------------------------------------------
-    // The attribute that opens the group. Compare against the CLEANED name, i.e.
-    // without any "(...)" part. It stays a normal top-level field itself.
-    private static final String GROUP_TRIGGER_ATTRIBUTE = "Conditional";
+    // ---- Konfiguration der Gruppierung --------------------------------------
 
     /**
-     * Value the trigger attribute must have for grouping to happen.
-     * {@code null} = always group, regardless of the value.
-     * Set to {@code "N"} to only nest when the trigger reads N.
+     * Attribut, das die Gruppe oeffnet (Vergleich mit dem BEREINIGTEN Namen,
+     * also ohne "(...)"-Teil). Es bleibt selbst auf oberster Ebene.
      */
-    private static final String GROUP_TRIGGER_VALUE = null;
+    private static final String GRUPPEN_START_ATTRIBUT = "Conditional";
 
     /**
-     * Grouping stops when this attribute is reached; that attribute and everything
-     * after it are written at top level again. {@code null} = group to end of record.
+     * Wert, den das Start-Attribut haben muss, damit gruppiert wird.
+     * {@code null} = immer gruppieren. {@code "N"} = nur bei Wert N gruppieren.
      */
-    private static final String GROUP_END_ATTRIBUTE = "GroupEnd";
+    private static final String GRUPPEN_START_WERT = null;
 
-    /** Name of the nested JSON object. */
-    private static final String GROUP_NAME = "customGroup";
+    /**
+     * Bei diesem Attribut endet die Gruppe; es liegt selbst wieder auf oberster
+     * Ebene. {@code null} = bis zum Ende des Datensatzes gruppieren.
+     */
+    private static final String GRUPPEN_ENDE_ATTRIBUT = "GroupEnd";
 
-    private static final Pattern INNERMOST_BRACKETS = Pattern.compile("\\([^()]*\\)");
-    private static final Pattern UNCLOSED_BRACKET = Pattern.compile("\\([^)]*$");
-    private static final Pattern WHITESPACE_RUN = Pattern.compile("\\s+");
-    private static final Pattern NOT_AVAILABLE = Pattern.compile("n\\.\\s*v\\.", Pattern.CASE_INSENSITIVE);
+    /** Name des verschachtelten JSON-Objekts. */
+    private static final String GRUPPEN_NAME = "customGroup";
+
+    // ---- regulaere Ausdruecke ------------------------------------------------
+
+    private static final Pattern INNERSTE_KLAMMERN = Pattern.compile("\\([^()]*\\)");
+    private static final Pattern OFFENE_KLAMMER = Pattern.compile("\\([^)]*$");
+    private static final Pattern MEHRFACH_LEERRAUM = Pattern.compile("\\s+");
+    private static final Pattern NICHT_VORHANDEN = Pattern.compile("n\\.\\s*v\\.", Pattern.CASE_INSENSITIVE);
     private static final Pattern LEER = Pattern.compile("^leer$", Pattern.CASE_INSENSITIVE);
-    private static final Pattern INVALID_FILENAME_CHARS = Pattern.compile("[\\\\/:*?\"<>|]");
+    private static final Pattern VERBOTENE_DATEINAMENSZEICHEN = Pattern.compile("[\\\\/:*?\"<>|]");
 
-    private CsvToJsonGenerator() {
+    private CsvZuJsonGenerator() {
     }
 
     public static void main(String[] args) throws IOException {
-        Path outputDir = resolveOutputDirectory();
-        List<Path> written = generate(outputDir);
+        Path ausgabeOrdner = ermittleAusgabeordner();
+        List<Path> geschrieben = erzeuge(ausgabeOrdner);
 
-        System.out.println("Wrote " + written.size() + " file(s) to " + outputDir.toAbsolutePath());
-        for (Path p : written) {
-            System.out.println("  " + p.getFileName());
+        System.out.println(geschrieben.size() + " Datei(en) geschrieben nach " + ausgabeOrdner.toAbsolutePath());
+        for (Path datei : geschrieben) {
+            System.out.println("  " + datei.getFileName());
         }
     }
 
     // ------------------------------------------------------------------
-    // main pipeline
+    // Hauptablauf
     // ------------------------------------------------------------------
 
-    /** Reads the CSV resource and writes one JSON file per record column. */
-    public static List<Path> generate(Path outputDir) throws IOException {
-        String csv = readResource(INPUT_RESOURCE);
-
-        List<String> physicalLines = splitLines(csv);
-        if (physicalLines.size() < 2) {
-            throw new IOException(INPUT_RESOURCE + " has fewer than two non-empty lines.");
+    /** Liest die CSV-Ressource und schreibt pro Datenspalte eine JSON-Datei. */
+    public static List<Path> erzeuge(Path ausgabeOrdner) throws IOException {
+        List<String> zeilen = leseZeilen(EINGABE_RESSOURCE);
+        if (zeilen.size() < 2) {
+            throw new IOException(EINGABE_RESSOURCE + " hat weniger als zwei nicht-leere Zeilen.");
         }
 
-        char delimiter = detectDelimiter(physicalLines.get(0));
-        List<String> records = stitchBrokenRecords(physicalLines, delimiter);
-
-        List<List<String>> table = new ArrayList<>();
-        for (String record : records) {
-            table.add(parseRecord(record, delimiter));
+        char trenner = ermittleTrennzeichen(zeilen.get(0));
+        List<List<String>> tabelle = new ArrayList<>();
+        for (String datensatz : repariereZeilenumbrueche(zeilen, trenner)) {
+            tabelle.add(zerlege(datensatz, trenner));
         }
 
-        List<String> header = table.get(0);
-        if (header.size() < 2) {
-            throw new IOException("Header parsed as a single column using delimiter '" + delimiter
-                    + "'. Header was: " + physicalLines.get(0));
+        List<String> kopf = tabelle.get(0);
+        if (kopf.size() < 2) {
+            throw new IOException("Kopfzeile ergab mit Trennzeichen '" + trenner
+                    + "' nur eine Spalte. Kopfzeile war: " + zeilen.get(0));
         }
 
-        Files.createDirectories(outputDir);
+        Files.createDirectories(ausgabeOrdner);
 
-        List<Path> written = new ArrayList<>();
-        // Column 0 holds the attribute names; every further column is one record.
-        for (int col = 1; col < header.size(); col++) {
-            Map<String, Object> data = new LinkedHashMap<>();
-            Map<String, Object> group = new LinkedHashMap<>();
-            boolean inGroup = false;
+        List<Path> geschrieben = new ArrayList<>();
+        Map<String, String> vergebeneNamen = new LinkedHashMap<>();
 
-            for (int rowIdx = 1; rowIdx < table.size(); rowIdx++) {
-                List<String> row = table.get(rowIdx);
+        // Spalte 0 enthaelt die Attributnamen, jede weitere Spalte einen Datensatz.
+        for (int spalte = 1; spalte < kopf.size(); spalte++) {
+            Map<String, Object> daten = baueDatensatz(tabelle, kopf, spalte);
+            Path ziel = ausgabeOrdner.resolve(freierDateiname(kopf.get(spalte), vergebeneNamen));
+            Files.write(ziel, zuJson(daten).getBytes(StandardCharsets.UTF_8));
+            geschrieben.add(ziel);
+        }
+        return geschrieben;
+    }
 
-                String attribute = cleanAttributeName(cell(row, 0));
-                if (attribute.isEmpty()) {
-                    continue;
-                }
+    /** Baut das (ggf. gruppierte) Schluessel-Wert-Objekt fuer eine Datenspalte. */
+    private static Map<String, Object> baueDatensatz(List<List<String>> tabelle, List<String> kopf, int spalte) {
+        Map<String, Object> daten = new LinkedHashMap<>();
+        Map<String, Object> gruppe = new LinkedHashMap<>();
+        boolean inGruppe = false;
 
-                String value = cell(row, col);
+        for (int zeile = 1; zeile < tabelle.size(); zeile++) {
+            List<String> felder = tabelle.get(zeile);
 
-                // The end marker closes the group and is itself top level again.
-                if (inGroup && attribute.equals(GROUP_END_ATTRIBUTE)) {
-                    inGroup = false;
-                }
+            String attribut = bereinigeAttributname(feld(felder, 0));
+            if (attribut.isEmpty()) {
+                continue; // Leer-/Trennzeilen ueberspringen
+            }
 
-                boolean isTrigger = attribute.equals(GROUP_TRIGGER_ATTRIBUTE);
+            String wert = feld(felder, spalte);
 
-                // Decide on the raw value, before the omission rules can drop it.
-                boolean opensGroup = isTrigger
-                        && (GROUP_TRIGGER_VALUE == null || GROUP_TRIGGER_VALUE.equalsIgnoreCase(value.trim()));
+            // Das Ende-Attribut schliesst die Gruppe und liegt selbst wieder oben.
+            if (inGruppe && attribut.equals(GRUPPEN_ENDE_ATTRIBUT)) {
+                inGruppe = false;
+            }
 
-                if (!isOmittedValue(value)) {
-                    // The trigger itself stays top level; grouping starts after it.
-                    Map<String, Object> target = (inGroup && !isTrigger) ? group : data;
-                    Object previous = target.put(attribute, value.trim());
-                    if (previous != null) {
-                        System.err.println("Warning: duplicate attribute '" + attribute
-                                + "' in column '" + header.get(col) + "' - keeping the last value.");
-                    }
-                }
+            boolean istStart = attribut.equals(GRUPPEN_START_ATTRIBUT);
 
-                if (opensGroup) {
-                    inGroup = true;
-                    // Reserve the group's slot here so it appears in source order.
-                    data.put(GROUP_NAME, group);
+            // Auf dem Rohwert entscheiden, bevor die Weglass-Regeln greifen koennen.
+            boolean oeffnetGruppe = istStart
+                    && (GRUPPEN_START_WERT == null || GRUPPEN_START_WERT.equalsIgnoreCase(wert.trim()));
+
+            if (!istWegzulassen(wert)) {
+                // Das Start-Attribut bleibt oben; gruppiert wird erst danach.
+                Map<String, Object> ziel = (inGruppe && !istStart) ? gruppe : daten;
+                if (ziel.put(attribut, wert.trim()) != null) {
+                    System.err.println("Warnung: Attribut '" + attribut + "' kommt in Spalte '"
+                            + kopf.get(spalte) + "' mehrfach vor - der letzte Wert gewinnt.");
                 }
             }
 
-            if (group.isEmpty()) {
-                data.remove(GROUP_NAME);
+            if (oeffnetGruppe) {
+                inGruppe = true;
+                // Platz der Gruppe hier reservieren, damit sie in Originalreihenfolge steht.
+                daten.put(GRUPPEN_NAME, gruppe);
             }
-
-            Path target = outputDir.resolve(toFileName(header.get(col)) + ".json");
-            Files.write(target, toJson(data).getBytes(StandardCharsets.UTF_8));
-            written.add(target);
         }
 
-        return written;
+        if (gruppe.isEmpty()) {
+            daten.remove(GRUPPEN_NAME);
+        }
+        return daten;
     }
 
     // ------------------------------------------------------------------
-    // reading / locating
+    // Einlesen und Pfade
     // ------------------------------------------------------------------
 
-    private static String readResource(String name) throws IOException {
-        ClassLoader loader = CsvToJsonGenerator.class.getClassLoader();
-        try (InputStream in = loader.getResourceAsStream(name)) {
-            if (in == null) {
-                throw new IOException("Resource '" + name + "' not found on the classpath. "
-                        + "Expected it at src/main/resources/" + name);
+    /** Liest die Ressource als UTF-8 (ohne BOM) und liefert die Zeilen ohne End-Leerzeilen. */
+    private static List<String> leseZeilen(String name) throws IOException {
+        String text;
+        try (InputStream eingabe = CsvZuJsonGenerator.class.getClassLoader().getResourceAsStream(name)) {
+            if (eingabe == null) {
+                throw new IOException("Ressource '" + name + "' nicht auf dem Klassenpfad gefunden. "
+                        + "Erwartet unter src/main/resources/" + name);
             }
-            StringBuilder sb = new StringBuilder();
-            char[] buf = new char[8192];
-            try (InputStreamReader reader = new InputStreamReader(in, StandardCharsets.UTF_8)) {
-                int read;
-                while ((read = reader.read(buf)) != -1) {
-                    sb.append(buf, 0, read);
-                }
-            }
-            // Strip a UTF-8 BOM if the export carries one.
-            if (sb.length() > 0 && sb.charAt(0) == '﻿') {
-                sb.deleteCharAt(0);
-            }
-            return sb.toString();
+            text = new String(eingabe.readAllBytes(), StandardCharsets.UTF_8);
         }
+        if (text.startsWith("﻿")) {
+            text = text.substring(1); // BOM des Exports entfernen
+        }
+
+        List<String> zeilen = new ArrayList<>(List.of(text.split("\r?\n", -1)));
+        // Nur Leerzeilen am Ende entfernen - Leerzeilen mittendrin koennen zu einem
+        // zerrissenen Datensatz gehoeren und werden beim Reparieren behandelt.
+        while (!zeilen.isEmpty() && zeilen.get(zeilen.size() - 1).trim().isEmpty()) {
+            zeilen.remove(zeilen.size() - 1);
+        }
+        return zeilen;
     }
 
     /**
-     * Prefers the source tree (src/main/resources/testfiles) so the generated files
-     * land next to the CSV and survive a clean build; falls back to the classpath
-     * output folder when that layout is not present.
-     *
-     * <p>Override with {@code -Dcsv2json.out=/some/path}.
+     * Bevorzugt den Quellbaum (src/main/resources/testfiles), damit die erzeugten
+     * Dateien neben der CSV liegen und einen Clean-Build ueberleben; sonst neben
+     * der CSV auf dem Klassenpfad. Uebersteuerbar mit {@code -Dcsv2json.out=/pfad}.
      */
-    private static Path resolveOutputDirectory() {
-        String override = System.getProperty("csv2json.out");
-        if (override != null && !override.isEmpty()) {
-            return Paths.get(override);
+    private static Path ermittleAusgabeordner() {
+        String uebersteuert = System.getProperty("csv2json.out");
+        if (uebersteuert != null && !uebersteuert.isEmpty()) {
+            return Paths.get(uebersteuert);
         }
 
-        Path sourceResources = Paths.get("src", "main", "resources");
-        if (Files.isDirectory(sourceResources)) {
-            return sourceResources.resolve(OUTPUT_FOLDER);
+        Path quellRessourcen = Paths.get("src", "main", "resources");
+        if (Files.isDirectory(quellRessourcen)) {
+            return quellRessourcen.resolve(AUSGABE_ORDNER);
         }
 
-        URL root = CsvToJsonGenerator.class.getClassLoader().getResource(INPUT_RESOURCE);
-        if (root != null && "file".equals(root.getProtocol())) {
+        var ressource = CsvZuJsonGenerator.class.getClassLoader().getResource(EINGABE_RESSOURCE);
+        if (ressource != null && "file".equals(ressource.getProtocol())) {
             try {
-                return Paths.get(root.toURI()).getParent().resolve(OUTPUT_FOLDER);
-            } catch (URISyntaxException e) {
-                throw new UncheckedIOException(new IOException("Could not resolve resource path", e));
+                return Paths.get(ressource.toURI()).getParent().resolve(AUSGABE_ORDNER);
+            } catch (java.net.URISyntaxException ignoriert) {
+                // dann eben der letzte Ausweg unten
             }
         }
-
-        return Paths.get(OUTPUT_FOLDER);
+        return Paths.get(AUSGABE_ORDNER);
     }
 
     // ------------------------------------------------------------------
-    // CSV normalization
+    // CSV-Normalisierung
     // ------------------------------------------------------------------
 
-    private static List<String> splitLines(String text) {
-        List<String> lines = new ArrayList<>();
-        for (String line : text.split("\r?\n", -1)) {
-            lines.add(line);
-        }
-        // Drop trailing blank lines only - blank lines in the middle may belong to a
-        // broken record and are handled during stitching.
-        while (!lines.isEmpty() && lines.get(lines.size() - 1).trim().isEmpty()) {
-            lines.remove(lines.size() - 1);
-        }
-        return lines;
-    }
-
-    private static char detectDelimiter(String header) throws IOException {
-        char best = 0;
-        int bestCount = 0;
-        for (char candidate : DELIMITER_CANDIDATES) {
-            int count = 0;
-            for (int i = 0; i < header.length(); i++) {
-                if (header.charAt(i) == candidate) {
-                    count++;
-                }
-            }
-            if (count > bestCount) {
-                bestCount = count;
-                best = candidate;
+    private static char ermittleTrennzeichen(String kopfzeile) throws IOException {
+        char bestes = 0;
+        long besteAnzahl = 0;
+        for (char kandidat : TRENNZEICHEN_KANDIDATEN) {
+            long anzahl = kopfzeile.chars().filter(c -> c == kandidat).count();
+            if (anzahl > besteAnzahl) {
+                besteAnzahl = anzahl;
+                bestes = kandidat;
             }
         }
-        if (bestCount == 0) {
-            throw new IOException("Could not detect a delimiter in the header line: " + header);
+        if (besteAnzahl == 0) {
+            throw new IOException("Kein Trennzeichen in der Kopfzeile erkennbar: " + kopfzeile);
         }
-        return best;
+        return bestes;
     }
 
     /**
-     * Joins physical lines until each record holds as many fields as the header and
-     * does not end inside an open quote.
+     * Setzt Datensaetze, die ueber mehrere physische Zeilen zerrissen sind, wieder
+     * zusammen: Zeilen werden angehaengt, bis der Datensatz so viele Felder hat wie
+     * die Kopfzeile und nicht in einem offenen Anfuehrungszeichen endet.
      */
-    private static List<String> stitchBrokenRecords(List<String> lines, char delimiter) {
-        int expectedFields = scan(lines.get(0), delimiter).fields;
+    private static List<String> repariereZeilenumbrueche(List<String> zeilen, char trenner) {
+        int erwarteteFelder = zerlege(zeilen.get(0), trenner).size();
 
-        List<String> records = new ArrayList<>();
-        StringBuilder buffer = null;
-        int repairs = 0;
+        List<String> datensaetze = new ArrayList<>();
+        StringBuilder puffer = null;
+        int reparaturen = 0;
 
-        for (String line : lines) {
-            if (buffer == null) {
-                if (line.trim().isEmpty()) {
+        for (String zeile : zeilen) {
+            if (puffer == null) {
+                if (zeile.trim().isEmpty()) {
                     continue;
                 }
-                buffer = new StringBuilder(line);
+                puffer = new StringBuilder(zeile);
             } else {
-                // A newline inside a quoted field is legitimate content; keep it.
-                // A newline in an unterminated record is export damage; remove it.
-                buffer.append(scan(buffer.toString(), delimiter).inQuotes ? "\n" : JOIN_WITH).append(line);
-                repairs++;
+                // Umbruch in einem offenen Anfuehrungszeichen ist echter Inhalt und
+                // bleibt erhalten; Umbruch in einem unfertigen Datensatz ist
+                // Export-Schaden und wird entfernt.
+                puffer.append(endetInAnfuehrung(puffer) ? "\n" : VERBINDER).append(zeile);
+                reparaturen++;
             }
 
-            Scan state = scan(buffer.toString(), delimiter);
-            if (!state.inQuotes && state.fields >= expectedFields) {
-                if (state.fields > expectedFields) {
-                    System.err.println("Warning: record has " + state.fields + " fields, expected "
-                            + expectedFields + ": " + preview(buffer.toString()));
-                }
-                records.add(buffer.toString());
-                buffer = null;
-            }
-        }
-
-        if (buffer != null) {
-            System.err.println("Warning: last record is incomplete: " + preview(buffer.toString()));
-            records.add(buffer.toString());
-        }
-
-        if (repairs > 0) {
-            System.out.println("Repaired " + repairs + " stray line break(s).");
-        }
-        return records;
-    }
-
-    private static String preview(String s) {
-        return s.length() <= 40 ? s : s.substring(0, 40) + "...";
-    }
-
-    /** Result of a quote-aware scan over a partial record. */
-    private static final class Scan {
-        final int fields;
-        final boolean inQuotes;
-
-        Scan(int fields, boolean inQuotes) {
-            this.fields = fields;
-            this.inQuotes = inQuotes;
-        }
-    }
-
-    private static Scan scan(String text, char delimiter) {
-        boolean inQuotes = false;
-        int fields = 1;
-        for (int i = 0; i < text.length(); i++) {
-            char c = text.charAt(i);
-            if (inQuotes) {
-                if (c == '"') {
-                    if (i + 1 < text.length() && text.charAt(i + 1) == '"') {
-                        i++; // escaped ""
-                    } else {
-                        inQuotes = false;
+            if (!endetInAnfuehrung(puffer)) {
+                int felder = zerlege(puffer.toString(), trenner).size();
+                if (felder >= erwarteteFelder) {
+                    if (felder > erwarteteFelder) {
+                        System.err.println("Warnung: Datensatz hat " + felder + " Felder, erwartet "
+                                + erwarteteFelder + ": " + vorschau(puffer));
                     }
+                    datensaetze.add(puffer.toString());
+                    puffer = null;
                 }
-            } else if (c == '"') {
-                inQuotes = true;
-            } else if (c == delimiter) {
-                fields++;
             }
         }
-        return new Scan(fields, inQuotes);
+
+        if (puffer != null) {
+            System.err.println("Warnung: letzter Datensatz ist unvollstaendig: " + vorschau(puffer));
+            datensaetze.add(puffer.toString());
+        }
+        if (reparaturen > 0) {
+            System.out.println(reparaturen + " verirrte(r) Zeilenumbruch/-brueche repariert.");
+        }
+        return datensaetze;
     }
 
-    /** Splits one complete record into fields, honouring quotes and "" escapes. */
-    private static List<String> parseRecord(String record, char delimiter) {
-        List<String> fields = new ArrayList<>();
-        StringBuilder current = new StringBuilder();
-        boolean inQuotes = false;
+    /** Endet der Text mitten in einem Anfuehrungszeichen-Feld? (beachtet ""-Escapes) */
+    private static boolean endetInAnfuehrung(CharSequence text) {
+        boolean inAnfuehrung = false;
+        for (int i = 0; i < text.length(); i++) {
+            if (text.charAt(i) == '"') {
+                inAnfuehrung = !inAnfuehrung;
+            }
+        }
+        // Ein "" zaehlt doppelt und hebt sich damit von selbst auf.
+        return inAnfuehrung;
+    }
 
-        for (int i = 0; i < record.length(); i++) {
-            char c = record.charAt(i);
-            if (inQuotes) {
-                if (c == '"') {
-                    if (i + 1 < record.length() && record.charAt(i + 1) == '"') {
-                        current.append('"');
+    /** Zerlegt einen vollstaendigen Datensatz in Felder (beachtet Anfuehrungszeichen und ""-Escapes). */
+    private static List<String> zerlege(String datensatz, char trenner) {
+        List<String> felder = new ArrayList<>();
+        StringBuilder aktuell = new StringBuilder();
+        boolean inAnfuehrung = false;
+
+        for (int i = 0; i < datensatz.length(); i++) {
+            char zeichen = datensatz.charAt(i);
+            if (inAnfuehrung) {
+                if (zeichen == '"') {
+                    if (i + 1 < datensatz.length() && datensatz.charAt(i + 1) == '"') {
+                        aktuell.append('"');
                         i++;
                     } else {
-                        inQuotes = false;
+                        inAnfuehrung = false;
                     }
                 } else {
-                    current.append(c);
+                    aktuell.append(zeichen);
                 }
-            } else if (c == '"') {
-                inQuotes = true;
-            } else if (c == delimiter) {
-                fields.add(current.toString());
-                current.setLength(0);
+            } else if (zeichen == '"') {
+                inAnfuehrung = true;
+            } else if (zeichen == trenner) {
+                felder.add(aktuell.toString());
+                aktuell.setLength(0);
             } else {
-                current.append(c);
+                aktuell.append(zeichen);
             }
         }
-        fields.add(current.toString());
-        return fields;
+        felder.add(aktuell.toString());
+        return felder;
     }
 
-    private static String cell(List<String> row, int index) {
-        return index < row.size() ? row.get(index) : "";
+    private static String feld(List<String> felder, int index) {
+        return index < felder.size() ? felder.get(index) : "";
+    }
+
+    private static String vorschau(CharSequence text) {
+        return text.length() <= 40 ? text.toString() : text.subSequence(0, 40) + "...";
     }
 
     // ------------------------------------------------------------------
-    // attribute / value normalization
+    // Attribut-/Wert-Normalisierung
     // ------------------------------------------------------------------
 
-    /** Removes "(...)" groups (nested included), collapses whitespace, trims. */
-    static String cleanAttributeName(String name) {
-        String result = name;
-        String previous;
+    /** Entfernt "(...)"-Gruppen (auch verschachtelte), buendelt Leerraum, trimmt. */
+    static String bereinigeAttributname(String name) {
+        String ergebnis = name, vorher;
         do {
-            previous = result;
-            result = INNERMOST_BRACKETS.matcher(result).replaceAll(" ");
-        } while (!result.equals(previous));
+            vorher = ergebnis;
+            ergebnis = INNERSTE_KLAMMERN.matcher(ergebnis).replaceAll(" ");
+        } while (!ergebnis.equals(vorher));
 
-        result = UNCLOSED_BRACKET.matcher(result).replaceAll(" ");
-        result = WHITESPACE_RUN.matcher(result).replaceAll(" ");
-        return result.trim();
+        ergebnis = OFFENE_KLAMMER.matcher(ergebnis).replaceAll(" ");
+        return MEHRFACH_LEERRAUM.matcher(ergebnis).replaceAll(" ").trim();
     }
 
-    /** True when the value should not produce a JSON property at all. */
-    static boolean isOmittedValue(String value) {
-        if (value == null) {
+    /** Wahr, wenn der Wert gar nicht erst ins JSON geschrieben werden soll. */
+    static boolean istWegzulassen(String wert) {
+        if (wert == null || wert.trim().isEmpty()) {
             return true;
         }
-        String v = value.trim();
-        if (v.isEmpty()) {
-            return true;
-        }
-        return NOT_AVAILABLE.matcher(v).find() || LEER.matcher(v).matches();
+        String getrimmt = wert.trim();
+        return NICHT_VORHANDEN.matcher(getrimmt).find() || LEER.matcher(getrimmt).matches();
     }
 
-    /** Whitespace becomes '_', path-hostile characters become '_'. */
-    static String toFileName(String columnHeader) {
-        String name = cleanAttributeName(columnHeader);
-        name = INVALID_FILENAME_CHARS.matcher(name).replaceAll("_");
-        name = WHITESPACE_RUN.matcher(name).replaceAll("_");
-        name = name.replace(' ', '_').trim();
-        return name.isEmpty() ? "unnamed" : name;
+    /**
+     * Dateiname aus dem Spaltenkopf: Leerraum und pfad-kritische Zeichen werden zu '_'.
+     * Die "(...)"-Teile bleiben absichtlich erhalten - sie unterscheiden oft zwei
+     * Spalten, ohne sie wuerden deren Dateien kollidieren.
+     * Kollidiert der Name trotzdem, wird _2, _3, ... angehaengt statt zu ueberschreiben.
+     */
+    private static String freierDateiname(String spaltenkopf, Map<String, String> vergeben) {
+        String basis = spaltenkopf.trim();
+        basis = VERBOTENE_DATEINAMENSZEICHEN.matcher(basis).replaceAll("_");
+        basis = MEHRFACH_LEERRAUM.matcher(basis).replaceAll("_");
+        if (basis.isEmpty()) {
+            basis = "unbenannt";
+        }
+
+        String dateiname = basis + ".json";
+        if (vergeben.containsKey(dateiname)) {
+            int lfdNr = 2;
+            while (vergeben.containsKey(basis + "_" + lfdNr + ".json")) {
+                lfdNr++;
+            }
+            System.err.println("Warnung: Spalten '" + vergeben.get(dateiname) + "' und '" + spaltenkopf
+                    + "' ergeben denselben Dateinamen - die zweite wird als "
+                    + basis + "_" + lfdNr + ".json geschrieben.");
+            dateiname = basis + "_" + lfdNr + ".json";
+        }
+        vergeben.put(dateiname, spaltenkopf);
+        return dateiname;
     }
 
     // ------------------------------------------------------------------
-    // JSON output
+    // JSON-Ausgabe
     // ------------------------------------------------------------------
 
-    private static String toJson(Map<String, Object> data) {
+    private static String zuJson(Map<String, Object> daten) {
         StringBuilder sb = new StringBuilder();
-        writeObject(sb, data, 1);
+        schreibeObjekt(sb, daten, 1);
         return sb.append('\n').toString();
     }
 
-    /** Writes a JSON object whose values are either Strings or nested Maps. */
+    /** Schreibt ein JSON-Objekt, dessen Werte Strings oder verschachtelte Maps sind. */
     @SuppressWarnings("unchecked")
-    private static void writeObject(StringBuilder sb, Map<String, Object> map, int depth) {
-        String pad = repeat("  ", depth);
-        String closePad = repeat("  ", depth - 1);
-
+    private static void schreibeObjekt(StringBuilder sb, Map<String, Object> objekt, int tiefe) {
         sb.append("{\n");
         int i = 0;
-        for (Map.Entry<String, Object> entry : map.entrySet()) {
-            sb.append(pad).append('"').append(escape(entry.getKey())).append("\": ");
+        for (Map.Entry<String, Object> eintrag : objekt.entrySet()) {
+            sb.append("  ".repeat(tiefe)).append('"').append(maskiere(eintrag.getKey())).append("\": ");
 
-            Object value = entry.getValue();
-            if (value instanceof Map) {
-                writeObject(sb, (Map<String, Object>) value, depth + 1);
+            if (eintrag.getValue() instanceof Map) {
+                schreibeObjekt(sb, (Map<String, Object>) eintrag.getValue(), tiefe + 1);
             } else {
-                sb.append('"').append(escape(String.valueOf(value))).append('"');
+                sb.append('"').append(maskiere(String.valueOf(eintrag.getValue()))).append('"');
             }
-
-            if (++i < map.size()) {
-                sb.append(',');
-            }
-            sb.append('\n');
+            sb.append(++i < objekt.size() ? ",\n" : "\n");
         }
-        sb.append(closePad).append('}');
+        sb.append("  ".repeat(tiefe - 1)).append('}');
     }
 
-    private static String repeat(String s, int times) {
-        StringBuilder sb = new StringBuilder(s.length() * times);
-        for (int i = 0; i < times; i++) {
-            sb.append(s);
-        }
-        return sb.toString();
-    }
-
-    private static String escape(String s) {
-        StringBuilder sb = new StringBuilder(s.length() + 8);
-        for (int i = 0; i < s.length(); i++) {
-            char c = s.charAt(i);
-            switch (c) {
+    /** Maskiert einen String fuer die JSON-Ausgabe. */
+    private static String maskiere(String text) {
+        StringBuilder sb = new StringBuilder(text.length() + 8);
+        for (int i = 0; i < text.length(); i++) {
+            char zeichen = text.charAt(i);
+            switch (zeichen) {
                 case '"':  sb.append("\\\""); break;
                 case '\\': sb.append("\\\\"); break;
                 case '\n': sb.append("\\n");  break;
                 case '\r': sb.append("\\r");  break;
                 case '\t': sb.append("\\t");  break;
-                case '\b': sb.append("\\b");  break;
-                case '\f': sb.append("\\f");  break;
                 default:
-                    if (c < 0x20) {
-                        sb.append(String.format("\\u%04x", (int) c));
+                    if (zeichen < 0x20) {
+                        sb.append(String.format("\\u%04x", (int) zeichen));
                     } else {
-                        sb.append(c);
+                        sb.append(zeichen);
                     }
             }
         }
