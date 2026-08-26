@@ -1,0 +1,183 @@
+// Gehoert in die Library, neben JsonObject. Bei Bedarf package-Zeile ergaenzen.
+
+import java.math.BigDecimal;
+import java.time.Instant;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.OffsetDateTime;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeFormatterBuilder;
+import java.time.format.DateTimeParseException;
+import java.time.temporal.ChronoField;
+import java.time.temporal.TemporalAccessor;
+import java.util.UUID;
+
+/**
+ * Sammelstelle fuer alle Typkonvertierungen aus den String-Feldern des
+ * {@code JsonObject}. Wird dem MapStruct-Mapper per {@code uses} mitgegeben:
+ *
+ * <pre>
+ * &#64;Mapper(uses = JsonKonvertierungen.class)
+ * public interface AnderesObjectMapper {
+ *     &#64;Mapping(source = "customGroup.groupedA", target = "groupedA")
+ *     AnderesObject vonJson(JsonObject quelle);
+ * }
+ * </pre>
+ *
+ * MapStruct waehlt die passende Methode automatisch anhand der Typ-Kombination
+ * (String -&gt; Zieltyp). Die Klasse braucht dafuer nur einen parameterlosen
+ * Konstruktor und public-Methoden - keine Annotationen.
+ *
+ * <p>Konvention durchgehend: {@code null} und Leerstring ergeben {@code null},
+ * unlesbare Werte werfen eine {@link IllegalArgumentException} mit Klartext -
+ * kein stilles Default.
+ */
+public class JsonKonvertierungen {
+
+    /** Zeitzone, in der zonenlose Zeitstempel des Exports gemeint sind. */
+    private static final ZoneId ZONE = ZoneId.of("Europe/Berlin");
+
+    /** Wert, der im Export fuer "hier bitte eine neue UUID" steht. */
+    private static final String UUID_PLATZHALTER = "UUID";
+
+    /** 21.07.2026 / 1.7.2026 / 21.07.26 */
+    private static final DateTimeFormatter DATUM_DEUTSCH = new DateTimeFormatterBuilder()
+            .appendValue(ChronoField.DAY_OF_MONTH)
+            .appendLiteral('.')
+            .appendValue(ChronoField.MONTH_OF_YEAR)
+            .appendLiteral('.')
+            .appendValueReduced(ChronoField.YEAR, 2, 4, 2000)
+            .toFormatter();
+
+    /** ISO-Zeitstempel, Offset optional: 2026-07-21T14:30:40[Z|+02:00] */
+    private static final DateTimeFormatter ZEITSTEMPEL = new DateTimeFormatterBuilder()
+            .append(DateTimeFormatter.ISO_LOCAL_DATE_TIME)
+            .optionalStart().appendOffsetId().optionalEnd()
+            .toFormatter();
+
+    // ------------------------------------------------------------------
+    // Wahrheitswerte
+    // ------------------------------------------------------------------
+
+    /** "J"/"Ja"/"Y"/"X"/"1"/"true" -> true, alles andere -> false. */
+    public boolean zuBoolean(String wert) {
+        if (wert == null) {
+            return false;
+        }
+        switch (wert.trim().toLowerCase()) {
+            case "j": case "ja": case "y": case "yes": case "x": case "true": case "1":
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Zahlen
+    // ------------------------------------------------------------------
+
+    /** Akzeptiert Komma als Dezimaltrenner: "10,5" -> 10.5 */
+    public BigDecimal zuBigDecimal(String wert) {
+        String text = getrimmtOderNull(wert);
+        if (text == null) {
+            return null;
+        }
+        try {
+            return new BigDecimal(dezimalpunkt(text));
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("Zahl '" + text + "' nicht lesbar.", e);
+        }
+    }
+
+    /** Ersetzt ein einzelnes Dezimalkomma durch einen Punkt; laesst "1,234.5" in Ruhe. */
+    private static String dezimalpunkt(String text) {
+        return (text.chars().filter(c -> c == ',').count() == 1 && !text.contains("."))
+                ? text.replace(',', '.') : text;
+    }
+
+    // ------------------------------------------------------------------
+    // UUID
+    // ------------------------------------------------------------------
+
+    /**
+     * Wandelt eine UUID um. Der Platzhalter {@code "UUID"} erzeugt eine neue
+     * Zufalls-UUID - Achtung: bei jedem Einlesen eine andere.
+     */
+    public UUID zuUuid(String wert) {
+        String text = getrimmtOderNull(wert);
+        if (text == null) {
+            return null;
+        }
+        if (UUID_PLATZHALTER.equalsIgnoreCase(text)) {
+            return UUID.randomUUID();
+        }
+        try {
+            return UUID.fromString(text);
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException("UUID '" + text + "' nicht lesbar.", e);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Datum und Zeit
+    // ------------------------------------------------------------------
+
+    /** Akzeptiert TT.MM.JJJJ (auch einstellig) und ISO JJJJ-MM-TT. */
+    public LocalDate zuLocalDate(String wert) {
+        String text = getrimmtOderNull(wert);
+        if (text == null) {
+            return null;
+        }
+        try {
+            return text.contains(".") ? LocalDate.parse(text, DATUM_DEUTSCH) : LocalDate.parse(text);
+        } catch (DateTimeParseException e) {
+            throw new IllegalArgumentException("Datum '" + text
+                    + "' nicht lesbar (erwartet TT.MM.JJJJ oder JJJJ-MM-TT).", e);
+        }
+    }
+
+    /**
+     * Akzeptiert ISO-Zeitstempel mit und ohne Offset sowie Leerzeichen statt 'T'.
+     * Fehlt der Offset, gilt {@link #ZONE}.
+     */
+    public Instant zuInstant(String wert) {
+        String text = getrimmtOderNull(wert);
+        if (text == null) {
+            return null;
+        }
+        try {
+            TemporalAccessor geparst = ZEITSTEMPEL.parseBest(
+                    text.replace(' ', 'T'), OffsetDateTime::from, LocalDateTime::from);
+            return (geparst instanceof OffsetDateTime offsetZeit)
+                    ? offsetZeit.toInstant()
+                    : ((LocalDateTime) geparst).atZone(ZONE).toInstant();
+        } catch (DateTimeParseException e) {
+            throw new IllegalArgumentException("Zeitstempel '" + text
+                    + "' nicht lesbar (erwartet JJJJ-MM-TTThh:mm:ss[Z]).", e);
+        }
+    }
+
+    /** Wie {@link #zuInstant}, aber als lokale Zeit ohne Zonenbezug. */
+    public LocalDateTime zuLocalDateTime(String wert) {
+        String text = getrimmtOderNull(wert);
+        if (text == null) {
+            return null;
+        }
+        try {
+            return LocalDateTime.parse(text.replace(' ', 'T'));
+        } catch (DateTimeParseException e) {
+            throw new IllegalArgumentException("Zeitstempel '" + text + "' nicht lesbar.", e);
+        }
+    }
+
+    // ------------------------------------------------------------------
+
+    private static String getrimmtOderNull(String wert) {
+        if (wert == null) {
+            return null;
+        }
+        String text = wert.trim();
+        return text.isEmpty() ? null : text;
+    }
+}
