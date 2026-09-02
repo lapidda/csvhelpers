@@ -1,5 +1,3 @@
-// Falls das Projekt Packages verwendet: oben z.B. `package de.optimalhelper.csv;`
-// ergaenzen und die Datei in den passenden Ordner unter src/main/java legen.
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -168,51 +166,66 @@ public final class CsvZuJsonGenerator {
 
     /** Baut das (ggf. gruppierte) Schluessel-Wert-Objekt fuer eine Datenspalte. */
     private static Map<String, Object> baueDatensatz(List<List<String>> tabelle, List<String> kopf, int spalte) {
-        Map<String, Object> daten = new LinkedHashMap<>();
-        Map<String, Object> gruppe = new LinkedHashMap<>();
-        boolean inGruppe = false;
-
+        Datensatz datensatz = new Datensatz(kopf.get(spalte));
         for (int zeile = 1; zeile < tabelle.size(); zeile++) {
             List<String> felder = tabelle.get(zeile);
+            datensatz.uebernimm(bereinigeAttributname(feld(felder, 0)), feld(felder, spalte));
+        }
+        return datensatz.ergebnis();
+    }
 
-            String attribut = bereinigeAttributname(feld(felder, 0));
+    /**
+     * Ein entstehender Datensatz samt Gruppierungszustand. Kapselt die Regeln,
+     * wann ein Attribut oben oder in der Gruppe landet.
+     */
+    private static final class Datensatz {
+        private final Map<String, Object> daten = new LinkedHashMap<>();
+        private final Map<String, Object> gruppe = new LinkedHashMap<>();
+        private final String spaltenname;
+        private boolean inGruppe;
+
+        Datensatz(String spaltenname) {
+            this.spaltenname = spaltenname;
+        }
+
+        void uebernimm(String attribut, String wert) {
             if (attribut.isEmpty()) {
-                continue; // Leer-/Trennzeilen ueberspringen
+                return; // Leer-/Trennzeilen ueberspringen
             }
-
-            String wert = feld(felder, spalte);
-
             // Das Ende-Attribut schliesst die Gruppe und liegt selbst wieder oben.
-            if (inGruppe && attribut.equals(GRUPPEN_ENDE_ATTRIBUT)) {
+            if (attribut.equals(GRUPPEN_ENDE_ATTRIBUT)) {
                 inGruppe = false;
             }
-
             boolean istStart = attribut.equals(GRUPPEN_START_ATTRIBUT);
 
-            // Auf dem Rohwert entscheiden, bevor die Weglass-Regeln greifen koennen.
-            boolean oeffnetGruppe = istStart
-                    && (GRUPPEN_START_WERT == null || GRUPPEN_START_WERT.equalsIgnoreCase(wert.trim()));
-
             if (!istWegzulassen(wert)) {
-                // Das Start-Attribut bleibt oben; gruppiert wird erst danach.
-                Map<String, Object> ziel = (inGruppe && !istStart) ? gruppe : daten;
-                if (ziel.put(attribut, excelDatum(wert.trim())) != null) {
-                    System.err.println("Warnung: Attribut '" + attribut + "' kommt in Spalte '"
-                            + kopf.get(spalte) + "' mehrfach vor - der letzte Wert gewinnt.");
-                }
+                schreibe(attribut, excelDatum(wert.trim()), inGruppe && !istStart);
             }
-
-            if (oeffnetGruppe) {
+            // Auf dem Rohwert entscheiden, bevor die Weglass-Regeln greifen koennen.
+            if (istStart && oeffnetGruppe(wert)) {
                 inGruppe = true;
-                // Platz der Gruppe hier reservieren, damit sie in Originalreihenfolge steht.
-                daten.put(GRUPPEN_NAME, gruppe);
+                daten.put(GRUPPEN_NAME, gruppe); // Platz in Originalreihenfolge reservieren
             }
         }
 
-        if (gruppe.isEmpty()) {
-            daten.remove(GRUPPEN_NAME);
+        private void schreibe(String attribut, String wert, boolean inDieGruppe) {
+            Map<String, Object> ziel = inDieGruppe ? gruppe : daten;
+            if (ziel.put(attribut, wert) != null) {
+                System.err.println("Warnung: Attribut '" + attribut + "' kommt in Spalte '"
+                        + spaltenname + "' mehrfach vor - der letzte Wert gewinnt.");
+            }
         }
-        return daten;
+
+        private static boolean oeffnetGruppe(String wert) {
+            return GRUPPEN_START_WERT == null || GRUPPEN_START_WERT.equalsIgnoreCase(wert.trim());
+        }
+
+        Map<String, Object> ergebnis() {
+            if (gruppe.isEmpty()) {
+                daten.remove(GRUPPEN_NAME);
+            }
+            return daten;
+        }
     }
 
     // ------------------------------------------------------------------
@@ -302,29 +315,21 @@ public final class CsvZuJsonGenerator {
         int reparaturen = 0;
 
         for (String zeile : zeilen) {
-            if (puffer == null) {
-                if (zeile.trim().isEmpty()) {
-                    continue;
-                }
-                puffer = new StringBuilder(zeile);
-            } else {
+            if (puffer != null) {
                 // Umbruch in einem offenen Anfuehrungszeichen ist echter Inhalt und
                 // bleibt erhalten; Umbruch in einem unfertigen Datensatz ist
                 // Export-Schaden und wird entfernt.
                 puffer.append(endetInAnfuehrung(puffer) ? "\n" : VERBINDER).append(zeile);
                 reparaturen++;
+            } else if (zeile.trim().isEmpty()) {
+                continue;
+            } else {
+                puffer = new StringBuilder(zeile);
             }
 
-            if (!endetInAnfuehrung(puffer)) {
-                int felder = zerlege(puffer.toString(), trenner).size();
-                if (felder >= erwarteteFelder) {
-                    if (felder > erwarteteFelder) {
-                        System.err.println("Warnung: Datensatz hat " + felder + " Felder, erwartet "
-                                + erwarteteFelder + ": " + vorschau(puffer));
-                    }
-                    datensaetze.add(puffer.toString());
-                    puffer = null;
-                }
+            if (istVollstaendig(puffer, erwarteteFelder, trenner)) {
+                datensaetze.add(puffer.toString());
+                puffer = null;
             }
         }
 
@@ -336,6 +341,19 @@ public final class CsvZuJsonGenerator {
             System.out.println(reparaturen + " verirrte(r) Zeilenumbruch/-brueche repariert.");
         }
         return datensaetze;
+    }
+
+    /** Hat der Datensatz alle Felder und endet nicht in einem offenen Anfuehrungszeichen? */
+    private static boolean istVollstaendig(StringBuilder puffer, int erwarteteFelder, char trenner) {
+        if (endetInAnfuehrung(puffer)) {
+            return false;
+        }
+        int felder = zerlege(puffer.toString(), trenner).size();
+        if (felder > erwarteteFelder) {
+            System.err.println("Warnung: Datensatz hat " + felder + " Felder, erwartet "
+                    + erwarteteFelder + ": " + vorschau(puffer));
+        }
+        return felder >= erwarteteFelder;
     }
 
     /** Endet der Text mitten in einem Anfuehrungszeichen-Feld? (beachtet ""-Escapes) */
@@ -358,20 +376,12 @@ public final class CsvZuJsonGenerator {
 
         for (int i = 0; i < datensatz.length(); i++) {
             char zeichen = datensatz.charAt(i);
-            if (inAnfuehrung) {
-                if (zeichen == '"') {
-                    if (i + 1 < datensatz.length() && datensatz.charAt(i + 1) == '"') {
-                        aktuell.append('"');
-                        i++;
-                    } else {
-                        inAnfuehrung = false;
-                    }
-                } else {
-                    aktuell.append(zeichen);
-                }
+            if (inAnfuehrung && istEscapteAnfuehrung(datensatz, i)) {
+                aktuell.append('"');
+                i++;                                  // das zweite " ueberspringen
             } else if (zeichen == '"') {
-                inAnfuehrung = true;
-            } else if (zeichen == trenner) {
+                inAnfuehrung = !inAnfuehrung;
+            } else if (zeichen == trenner && !inAnfuehrung) {
                 felder.add(aktuell.toString());
                 aktuell.setLength(0);
             } else {
@@ -380,6 +390,11 @@ public final class CsvZuJsonGenerator {
         }
         felder.add(aktuell.toString());
         return felder;
+    }
+
+    /** Steht an Position i ein "" (ein maskiertes Anfuehrungszeichen)? */
+    private static boolean istEscapteAnfuehrung(String text, int i) {
+        return text.charAt(i) == '"' && i + 1 < text.length() && text.charAt(i + 1) == '"';
     }
 
     private static String feld(List<String> felder, int index) {
