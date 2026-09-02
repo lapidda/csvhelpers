@@ -3,10 +3,15 @@
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.LocalTime;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -81,6 +86,21 @@ public final class CsvZuJsonGenerator {
     /** Name des verschachtelten JSON-Objekts. */
     private static final String GRUPPEN_NAME = "customGroup";
 
+    // ---- Excel-Seriendatum ---------------------------------------------------
+
+    /** Excel-Zahlen in wissenschaftlicher Schreibweise als Datum ausgeben. */
+    private static final boolean EXCEL_DATUM_ERKENNEN = true;
+
+    /**
+     * Excel-Tag 1 ist der 01.01.1900. Wegen des Schaltjahr-Fehlers von 1900
+     * (Excel kennt einen 29.02.1900, den es nie gab) ist die Rechenbasis der 30.12.1899.
+     */
+    private static final LocalDate EXCEL_EPOCHE = LocalDate.of(1899, 12, 30);
+
+    /** Plausibler Bereich: 31.12.1899 bis 31.12.2999. */
+    private static final double SERIAL_MIN = 1;
+    private static final double SERIAL_MAX = 401768;
+
     // ---- regulaere Ausdruecke ------------------------------------------------
 
     private static final Pattern INNERSTE_KLAMMERN = Pattern.compile("\\([^()]*\\)");
@@ -89,6 +109,11 @@ public final class CsvZuJsonGenerator {
     private static final Pattern NICHT_VORHANDEN = Pattern.compile("n\\.\\s*v\\.", Pattern.CASE_INSENSITIVE);
     private static final Pattern LEER = Pattern.compile("^leer$", Pattern.CASE_INSENSITIVE);
     private static final Pattern VERBOTENE_DATEINAMENSZEICHEN = Pattern.compile("[\\\\/:*?\"<>|]");
+    private static final Pattern WISSENSCHAFTLICHE_ZAHL =
+            Pattern.compile("^[+-]?\\d+([.,]\\d+)?[eE][+-]?\\d+$");
+    private static final DateTimeFormatter DATUM_AUSGABE = DateTimeFormatter.ofPattern("dd.MM.yyyy");
+    private static final DateTimeFormatter DATUM_ZEIT_AUSGABE =
+            DateTimeFormatter.ofPattern("dd.MM.yyyy HH:mm:ss");
 
     private CsvZuJsonGenerator() {
     }
@@ -171,7 +196,7 @@ public final class CsvZuJsonGenerator {
             if (!istWegzulassen(wert)) {
                 // Das Start-Attribut bleibt oben; gruppiert wird erst danach.
                 Map<String, Object> ziel = (inGruppe && !istStart) ? gruppe : daten;
-                if (ziel.put(attribut, wert.trim()) != null) {
+                if (ziel.put(attribut, excelDatum(wert.trim())) != null) {
                     System.err.println("Warnung: Attribut '" + attribut + "' kommt in Spalte '"
                             + kopf.get(spalte) + "' mehrfach vor - der letzte Wert gewinnt.");
                 }
@@ -379,6 +404,41 @@ public final class CsvZuJsonGenerator {
 
         ergebnis = OFFENE_KLAMMER.matcher(ergebnis).replaceAll(" ");
         return MEHRFACH_LEERRAUM.matcher(ergebnis).replaceAll(" ").trim();
+    }
+
+    /**
+     * Wandelt eine Excel-Seriennummer in wissenschaftlicher Schreibweise
+     * (z.B. "4,6234E+04", wie Excel sie in zu schmalen Spalten exportiert) in ein
+     * lesbares Datum. Alles andere - auch schlichte Ganzzahlen - bleibt unangetastet,
+     * damit echte Messwerte nicht versehentlich zu Datumsangaben werden.
+     */
+    static String excelDatum(String wert) {
+        if (!EXCEL_DATUM_ERKENNEN || wert == null || !WISSENSCHAFTLICHE_ZAHL.matcher(wert).matches()) {
+            return wert;
+        }
+
+        double serial;
+        try {
+            serial = new BigDecimal(wert.replace(',', '.')).doubleValue();
+        } catch (NumberFormatException e) {
+            return wert;
+        }
+
+        if (!(serial >= SERIAL_MIN && serial <= SERIAL_MAX)) {
+            System.err.println("Warnung: '" + wert + "' sieht nach einer Excel-Zahl aus, liegt aber "
+                    + "ausserhalb des Datumsbereichs - unveraendert uebernommen.");
+            return wert;
+        }
+
+        long tage = (long) Math.floor(serial);
+        double bruchteil = serial - tage;
+        LocalDate datum = EXCEL_EPOCHE.plusDays(tage);
+
+        if (bruchteil < 1e-9) {
+            return datum.format(DATUM_AUSGABE);   // reines Datum
+        }
+        long sekunden = Math.min(Math.round(bruchteil * 86400), 86399);
+        return LocalDateTime.of(datum, LocalTime.ofSecondOfDay(sekunden)).format(DATUM_ZEIT_AUSGABE);
     }
 
     /** Wahr, wenn der Wert gar nicht erst ins JSON geschrieben werden soll. */
